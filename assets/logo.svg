@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#29B6F6" />
+      <stop offset="100%" stop-color="#0288D1" />
+    </linearGradient>
+    <linearGradient id="plane-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#E1F5FE" />
+    </linearGradient>
+    <linearGradient id="sparkle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFEB3B" />
+      <stop offset="100%" stop-color="#FFB300" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#01579B" flood-opacity="0.25" />
+    </filter>
+  </defs>
+
+  <!-- App Icon Base -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg-grad)" filter="url(#shadow)" />
+
+  <!-- Telegram Paper Airplane -->
+  <g transform="translate(18, 22)">
+    <!-- Main Paper Plane Shape -->
+    <path d="M12 44 L78 12 L56 76 L40 54 Z" fill="url(#plane-grad)" opacity="0.95" />
+    <!-- Wing Fold Under-Shadow -->
+    <path d="M40 54 L56 76 L47 59 Z" fill="#B3E5FC" />
+    <path d="M32 48 L78 12 L40 54 Z" fill="#FFFFFF" />
+  </g>
+
+  <!-- AI Sparkle 1 (Large Top Right) -->
+  <path d="M96 16 C96 23 99 26 106 26 C99 26 96 29 96 36 C96 29 93 26 86 26 C93 26 96 23 96 16 Z" fill="url(#sparkle-grad)" />
+
+  <!-- AI Sparkle 2 (Small Accent) -->
+  <path d="M108 38 C108 42 110 44 114 44 C110 44 108 46 108 50 C108 46 106 44 102 44 C106 44 108 42 108 38 Z" fill="#FFF59D" />
+</svg>

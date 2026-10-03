@@ -1,6 +1,6 @@
 <div align="center">
 
-# tdl-aiexport
+# <img src="assets/logo.svg" width="30" alt="tdl-aiexport"> tdl-aiexport
 
 **Token-optimized, machine-readable & multimodal Telegram chat exporter for [`tdl`](https://github.com/iyear/tdl)**
 
