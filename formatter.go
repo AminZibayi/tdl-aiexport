@@ -184,3 +184,25 @@ func (f *Formatter) formatMarkdown(w io.Writer, meta ChatMetadata, messages []*E
 	_, err := io.WriteString(w, sb.String())
 	return err
 }
+func sanitizeNameForAI(s string) string {
+	if idx := strings.Index(s, "(@"); idx >= 0 {
+		end := strings.Index(s[idx:], ")")
+		if end > 2 {
+			return s[idx+2 : idx+end]
+		}
+	}
+	var clean strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			clean.WriteRune(r)
+		}
+	}
+	res := clean.String()
+	if len(res) > 64 {
+		res = res[:64]
+	}
+	if res == "" {
+		res = "user"
+	}
+	return res
+}
