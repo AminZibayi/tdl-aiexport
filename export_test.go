@@ -38,6 +38,36 @@ func TestParseByteSize(t *testing.T) {
 	}
 }
 
+func TestNormalizeChatTarget(t *testing.T) {
+	tests := []struct {
+		input      string
+		wantID     int64
+		wantIsNum  bool
+		wantNorm   string
+	}{
+		{"", 0, false, ""},
+		{"me", 0, false, ""},
+		{"self", 0, false, ""},
+		{"8085664706", 8085664706, true, "8085664706"},
+		{"-1001697797156", 1697797156, true, "1697797156"},
+		{"-123456789", 123456789, true, "123456789"},
+		{"https://t.me/c/1697797156/151", 1697797156, true, "1697797156"},
+		{"t.me/c/1697797156", 1697797156, true, "1697797156"},
+		{"@Telegram", 0, false, "Telegram"},
+		{"https://t.me/Telegram/193", 0, false, "Telegram"},
+		{"https://t.me/s/Telegram", 0, false, "Telegram"},
+		{"+989123456789", 0, false, "+989123456789"},
+	}
+
+	for _, tt := range tests {
+		gotID, gotIsNum, gotNorm := normalizeChatTarget(tt.input)
+		if gotID != tt.wantID || gotIsNum != tt.wantIsNum || gotNorm != tt.wantNorm {
+			t.Errorf("normalizeChatTarget(%q) = (%d, %v, %q), want (%d, %v, %q)",
+				tt.input, gotID, gotIsNum, gotNorm, tt.wantID, tt.wantIsNum, tt.wantNorm)
+		}
+	}
+}
+
 func TestSanitizeNameForAI(t *testing.T) {
 	tests := []struct {
 		input    string

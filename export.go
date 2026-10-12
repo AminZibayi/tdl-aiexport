@@ -13,7 +13,9 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/go-faster/errors"
+	"github.com/gotd/td/constant"
 	"github.com/gotd/td/telegram/downloader"
+	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/query/messages"
@@ -48,6 +50,7 @@ type Exporter struct {
 	ext                *extension.Extension
 	opts               ExporterOptions
 	manager            *peers.Manager
+	currentEntities    peer.Entities
 	senderCache        map[int64]string
 	msgCache           map[int]*ExportMessage
 	includedMediaTypes map[string]bool
@@ -93,7 +96,11 @@ func NewExporter(ext *extension.Extension, opts ExporterOptions) *Exporter {
 
 func (e *Exporter) Run(ctx context.Context) error {
 	client := e.ext.Client()
-	e.manager = peers.Options{}.Build(client.API())
+	e.manager = peers.Options{
+		Storage: &peers.InmemoryStorage{},
+		Cache:   &peers.InmemoryCache{},
+		Logger:  e.ext.Log(),
+	}.Build(client.API())
 
 	// 1. Resolve Target Chat
 	peer, err := e.resolveTargetChat(ctx)
@@ -144,6 +151,7 @@ func (e *Exporter) Run(ctx context.Context) error {
 
 	for iter.Next(ctx) {
 		val := iter.Value()
+		e.currentEntities = val.Entities
 		msgClass := val.Msg
 
 		msgDate := msgClass.GetDate()
@@ -231,23 +239,149 @@ func (e *Exporter) Run(ctx context.Context) error {
 	return nil
 }
 
-func (e *Exporter) resolveTargetChat(ctx context.Context) (peers.Peer, error) {
-	if e.opts.ChatTarget == "" {
-		return e.manager.Self(ctx)
+func normalizeChatTarget(target string) (numericID int64, isNumeric bool, normalized string) {
+	target = strings.TrimSpace(target)
+	if target == "" || strings.EqualFold(target, "me") || strings.EqualFold(target, "self") {
+		return 0, false, ""
 	}
-	target := strings.TrimSpace(e.opts.ChatTarget)
 
-	p, err := tutil.GetInputPeer(ctx, e.manager, target)
+	if !strings.HasPrefix(target, "+") {
+		if id, err := strconv.ParseInt(target, 10, 64); err == nil && id != 0 {
+			if id < 0 {
+				tdID := constant.TDLibPeerID(id)
+				if tdID.IsChannel() || tdID.IsChat() {
+					plain := tdID.ToPlain()
+					return plain, true, strconv.FormatInt(plain, 10)
+				}
+				plain := -id
+				return plain, true, strconv.FormatInt(plain, 10)
+			}
+			return id, true, strconv.FormatInt(id, 10)
+		}
+	}
+
+	trimmed := strings.TrimPrefix(target, "@")
+	trimmed = strings.TrimPrefix(trimmed, "https://t.me/")
+	trimmed = strings.TrimPrefix(trimmed, "http://t.me/")
+	trimmed = strings.TrimPrefix(trimmed, "t.me/")
+	trimmed = strings.TrimPrefix(trimmed, "/")
+
+	if strings.HasPrefix(trimmed, "c/") {
+		rest := strings.TrimPrefix(trimmed, "c/")
+		parts := strings.SplitN(rest, "/", 2)
+		if id, err := strconv.ParseInt(parts[0], 10, 64); err == nil && id > 0 {
+			return id, true, strconv.FormatInt(id, 10)
+		}
+	}
+
+	if strings.HasPrefix(trimmed, "s/") {
+		trimmed = strings.TrimPrefix(trimmed, "s/")
+	}
+	if !strings.HasPrefix(trimmed, "+") && !strings.HasPrefix(trimmed, "joinchat/") {
+		if idx := strings.IndexByte(trimmed, '/'); idx > 0 {
+			trimmed = trimmed[:idx]
+		}
+		if idx := strings.IndexByte(trimmed, '?'); idx > 0 {
+			trimmed = trimmed[:idx]
+		}
+	}
+
+	return 0, false, trimmed
+}
+
+func (e *Exporter) applyPeerEntities(ctx context.Context, ent peer.Entities) {
+	usersMap := ent.Users()
+	chatsMap := ent.Chats()
+	channelsMap := ent.Channels()
+	if len(usersMap) == 0 && len(chatsMap) == 0 && len(channelsMap) == 0 {
+		return
+	}
+
+	users := make([]tg.UserClass, 0, len(usersMap))
+	for _, u := range usersMap {
+		users = append(users, u)
+	}
+
+	chats := make([]tg.ChatClass, 0, len(chatsMap)+len(channelsMap))
+	for _, c := range chatsMap {
+		chats = append(chats, c)
+	}
+	for _, ch := range channelsMap {
+		chats = append(chats, ch)
+	}
+
+	_ = e.manager.Apply(ctx, users, chats)
+}
+
+func (e *Exporter) findPeerInEntities(ctx context.Context, ent peer.Entities, id int64) (peers.Peer, bool) {
+	if ch, ok := ent.Channels()[id]; ok {
+		e.applyPeerEntities(ctx, ent)
+		return e.manager.Channel(ch), true
+	}
+	if u, ok := ent.Users()[id]; ok {
+		e.applyPeerEntities(ctx, ent)
+		return e.manager.User(u), true
+	}
+	if c, ok := ent.Chats()[id]; ok {
+		e.applyPeerEntities(ctx, ent)
+		return e.manager.Chat(c), true
+	}
+	return nil, false
+}
+
+func (e *Exporter) resolveNumericChat(ctx context.Context, plainID int64) (peers.Peer, error) {
+	if self, err := e.manager.Self(ctx); err == nil && self.ID() == plainID {
+		return self, nil
+	}
+
+	dlgIter := query.GetDialogs(e.ext.Client().API()).BatchSize(100).Iter()
+	for dlgIter.Next(ctx) {
+		elem := dlgIter.Value()
+		if p, ok := e.findPeerInEntities(ctx, elem.Entities, plainID); ok {
+			return p, nil
+		}
+	}
+
+	if contacts, err := e.ext.Client().API().ContactsGetContacts(ctx, 0); err == nil {
+		if c, ok := contacts.(*tg.ContactsContacts); ok {
+			_ = e.manager.Apply(ctx, c.Users, nil)
+			for _, userClass := range c.Users {
+				if u, ok := userClass.AsNotEmpty(); ok && u.ID == plainID {
+					return e.manager.User(u), nil
+				}
+			}
+		}
+	}
+
+	p, err := tutil.GetInputPeer(ctx, e.manager, strconv.FormatInt(plainID, 10))
 	if err == nil {
 		return p, nil
 	}
 
-	normalized := strings.TrimPrefix(target, "@")
-	normalized = strings.TrimPrefix(normalized, "https://t.me/")
-	normalized = strings.TrimPrefix(normalized, "http://t.me/")
-	normalized = strings.TrimPrefix(normalized, "t.me/")
-	lower := strings.ToLower(normalized)
+	return nil, fmt.Errorf("failed to resolve chat %q: %w", e.opts.ChatTarget, err)
+}
 
+func (e *Exporter) resolveTargetChat(ctx context.Context) (peers.Peer, error) {
+	numericID, isNumeric, normalized := normalizeChatTarget(e.opts.ChatTarget)
+	if normalized == "" && !isNumeric {
+		return e.manager.Self(ctx)
+	}
+
+	if isNumeric {
+		return e.resolveNumericChat(ctx, numericID)
+	}
+
+	target := strings.TrimSpace(e.opts.ChatTarget)
+	if p, err := e.manager.Resolve(ctx, target); err == nil {
+		return p, nil
+	}
+
+	p, err := tutil.GetInputPeer(ctx, e.manager, normalized)
+	if err == nil {
+		return p, nil
+	}
+
+	lower := strings.ToLower(normalized)
 	if p, err2 := tutil.GetInputPeer(ctx, e.manager, lower); err2 == nil {
 		return p, nil
 	}
@@ -458,6 +592,8 @@ func (e *Exporter) resolveSender(ctx context.Context, defaultPeer peers.Peer, pe
 	if name, cached := e.senderCache[id]; cached {
 		return name, id
 	}
+
+	e.applyPeerEntities(ctx, e.currentEntities)
 
 	var name string
 	switch p := peer.(type) {
