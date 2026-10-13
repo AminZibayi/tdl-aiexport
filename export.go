@@ -1,7 +1,8 @@
 package main
-
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
 	"github.com/fatih/color"
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/constant"
@@ -44,6 +44,8 @@ type ExporterOptions struct {
 	MediaTypes    string // e.g. "photo,sticker,voice" or "all"
 	ExcludeMedia  string // e.g. "video,document"
 	MaxMediaSize  string // e.g. "10MB", "500KB", "0" (unlimited)
+	UpdateMode    bool
+	Overwrite     bool
 }
 
 type Exporter struct {
@@ -111,6 +113,26 @@ func (e *Exporter) Run(ctx context.Context) error {
 	chatMeta := e.buildChatMetadata(peer)
 	color.Cyan("Exporting chat: %s (ID: %d, Type: %s)", chatMeta.Title, chatMeta.ID, chatMeta.Type)
 
+	// Detect existing export to automatically resume from last exported message
+	targetFile := e.resolveOutputFileName(chatMeta)
+	var existing *ExistingExportInfo
+
+	if targetFile != "" && !e.opts.Overwrite && e.opts.UpdateMode {
+		if _, err := os.Stat(targetFile); err == nil {
+			info, err := e.inspectExistingExport(targetFile, e.opts.Format)
+			if err == nil && info != nil && info.LastMsgID > 0 {
+				existing = info
+				if e.opts.FromID == 0 {
+					e.opts.FromID = existing.LastMsgID + 1
+					color.Cyan("Found existing export at %s (%d messages, last ID: %d)", targetFile, existing.TotalMsgs, existing.LastMsgID)
+					color.Cyan("Automatically resuming from message ID %d...", e.opts.FromID)
+				} else {
+					color.Cyan("Found existing export at %s (%d messages, last ID: %d). Using explicit --from-id %d", targetFile, existing.TotalMsgs, existing.LastMsgID, e.opts.FromID)
+				}
+			}
+		}
+	}
+
 	if e.opts.DownloadMedia {
 		if err := os.MkdirAll(e.opts.MediaDir, 0o755); err != nil {
 			return errors.Wrap(err, "create media dir")
@@ -143,7 +165,6 @@ func (e *Exporter) Run(ctx context.Context) error {
 	} else if untilTs > 0 {
 		iter = iter.OffsetDate(int(untilTs) + 1)
 	}
-
 	// 4. Fetch and process messages
 	color.Blue("Fetching messages from Telegram...")
 	rawMessages := make([]*ExportMessage, 0, 256)
@@ -206,7 +227,22 @@ func (e *Exporter) Run(ctx context.Context) error {
 
 	fmt.Printf("\rCollected total %d messages.\n", len(rawMessages))
 
+	// Filter out messages already present in the existing export to avoid duplicates
+	if existing != nil && len(existing.ExistingIDs) > 0 {
+		filtered := make([]*ExportMessage, 0, len(rawMessages))
+		for _, m := range rawMessages {
+			if _, exists := existing.ExistingIDs[m.ID]; !exists {
+				filtered = append(filtered, m)
+			}
+		}
+		rawMessages = filtered
+	}
+
 	if len(rawMessages) == 0 {
+		if existing != nil && existing.TotalMsgs > 0 {
+			color.Green("✓ Export is already up to date (%d messages in %s, last ID: %d)", existing.TotalMsgs, targetFile, existing.LastMsgID)
+			return nil
+		}
 		color.Yellow("No messages matched the export criteria.")
 		return nil
 	}
@@ -221,9 +257,16 @@ func (e *Exporter) Run(ctx context.Context) error {
 	// 6. Enrich reply context from cached messages
 	e.enrichReplyContext(rawMessages)
 
-	chatMeta.TotalExport = len(rawMessages)
+	// 7. Write Output: update existing export or write fresh
+	if existing != nil && existing.TotalMsgs > 0 && targetFile != "" {
+		if err := e.updateExistingExport(targetFile, chatMeta, existing, rawMessages); err != nil {
+			return errors.Wrap(err, "update existing export")
+		}
+		color.Green("✓ Export updated successfully (+%d new messages, total: %d in %s)", len(rawMessages), existing.TotalMsgs+len(rawMessages), targetFile)
+		return nil
+	}
 
-	// 7. Write Output
+	chatMeta.TotalExport = len(rawMessages)
 	outWriter, closeFn, err := e.prepareOutputWriter(chatMeta)
 	if err != nil {
 		return err
@@ -237,6 +280,369 @@ func (e *Exporter) Run(ctx context.Context) error {
 
 	color.Green("✓ Export completed successfully (%d messages, format: %s)", len(rawMessages), e.opts.Format)
 	return nil
+}
+
+type ExistingExportInfo struct {
+	Path        string
+	Format      string
+	LastMsgID   int
+	TotalMsgs   int
+	ExistingIDs map[int]struct{}
+	Metadata    *ChatMetadata
+}
+
+func (e *Exporter) resolveOutputFileName(chat ChatMetadata) string {
+	if e.opts.OutputFile == "" || e.opts.OutputFile == "-" {
+		return ""
+	}
+
+	filename := e.opts.OutputFile
+	base := filepath.Base(filename)
+	if !strings.Contains(base, ".") {
+		ext := e.opts.Format
+		if ext == "markdown" || ext == "transcript" {
+			ext = "md"
+		}
+		filename = fmt.Sprintf("%s.%s", filename, ext)
+	}
+	return filename
+}
+
+func (e *Exporter) inspectExistingExport(filePath string, format string) (*ExistingExportInfo, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.Size() == 0 {
+		return &ExistingExportInfo{
+			Path:        filePath,
+			Format:      format,
+			ExistingIDs: make(map[int]struct{}),
+		}, nil
+	}
+
+	info := &ExistingExportInfo{
+		Path:        filePath,
+		Format:      format,
+		ExistingIDs: make(map[int]struct{}),
+	}
+
+	fmtLower := strings.ToLower(format)
+	switch {
+	case fmtLower == "jsonl" || fmtLower == "ndjson" || strings.HasSuffix(filePath, ".jsonl") || strings.HasSuffix(filePath, ".ndjson"):
+		err = e.inspectExistingJSONL(f, info)
+	case fmtLower == "json" || strings.HasSuffix(filePath, ".json"):
+		err = e.inspectExistingJSON(f, info)
+	case fmtLower == "markdown" || fmtLower == "md" || strings.HasSuffix(filePath, ".md"):
+		err = e.inspectExistingMarkdown(f, info)
+	default:
+		err = e.inspectExistingJSONL(f, info)
+	}
+
+	return info, err
+}
+
+func (e *Exporter) inspectExistingJSONL(f *os.File, info *ExistingExportInfo) error {
+	reader := bufio.NewReaderSize(f, 64*1024)
+	isFirstLine := true
+
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			if isFirstLine {
+				isFirstLine = false
+				if strings.Contains(trimmed, `"_type"`) && strings.Contains(trimmed, `"chat_metadata"`) {
+					var header struct {
+						Chat ChatMetadata `json:"chat"`
+					}
+					if json.Unmarshal([]byte(trimmed), &header) == nil {
+						info.Metadata = &header.Chat
+					}
+					continue
+				}
+			}
+
+			var snippet struct {
+				ID   int    `json:"id"`
+				From string `json:"from"`
+				Text string `json:"text"`
+			}
+			if json.Unmarshal([]byte(trimmed), &snippet) == nil && snippet.ID > 0 {
+				info.TotalMsgs++
+				info.ExistingIDs[snippet.ID] = struct{}{}
+				if snippet.ID > info.LastMsgID {
+					info.LastMsgID = snippet.ID
+				}
+				e.msgCache[snippet.ID] = &ExportMessage{
+					ID:   snippet.ID,
+					From: snippet.From,
+					Text: snippet.Text,
+				}
+			}
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Exporter) inspectExistingJSON(f *os.File, info *ExistingExportInfo) error {
+	var payload FullJSONPayload
+	if err := json.NewDecoder(f).Decode(&payload); err != nil {
+		return err
+	}
+	info.Metadata = &payload.Chat
+	info.TotalMsgs = len(payload.Messages)
+	for _, m := range payload.Messages {
+		info.ExistingIDs[m.ID] = struct{}{}
+		if m.ID > info.LastMsgID {
+			info.LastMsgID = m.ID
+		}
+		msgCopy := m
+		e.msgCache[m.ID] = &msgCopy
+	}
+	return nil
+}
+
+func (e *Exporter) inspectExistingMarkdown(f *os.File, info *ExistingExportInfo) error {
+	reader := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "### [") {
+			after := trimmed[5:]
+			closeIdx := strings.IndexByte(after, ']')
+			if closeIdx > 0 {
+				if id, perr := strconv.Atoi(after[:closeIdx]); perr == nil && id > 0 {
+					info.TotalMsgs++
+					info.ExistingIDs[id] = struct{}{}
+					if id > info.LastMsgID {
+						info.LastMsgID = id
+					}
+				}
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func replaceFile(src, dst string) error {
+	bak := dst + ".bak"
+	_ = os.Remove(bak)
+
+	if err := os.Rename(dst, bak); err == nil {
+		if err := os.Rename(src, dst); err != nil {
+			_ = os.Rename(bak, dst)
+			return err
+		}
+		_ = os.Remove(bak)
+		return nil
+	}
+
+	_ = os.Remove(dst)
+	return os.Rename(src, dst)
+}
+
+func (e *Exporter) updateExistingExport(targetFile string, chatMeta ChatMetadata, existing *ExistingExportInfo, newMessages []*ExportMessage) error {
+	fmtLower := strings.ToLower(e.opts.Format)
+	switch {
+	case fmtLower == "jsonl" || fmtLower == "ndjson" || strings.HasSuffix(targetFile, ".jsonl") || strings.HasSuffix(targetFile, ".ndjson"):
+		return e.updateExistingJSONL(targetFile, chatMeta, existing, newMessages)
+	case fmtLower == "json" || strings.HasSuffix(targetFile, ".json"):
+		return e.updateExistingJSON(targetFile, chatMeta, existing, newMessages)
+	case fmtLower == "markdown" || fmtLower == "md" || strings.HasSuffix(targetFile, ".md"):
+		return e.updateExistingMarkdown(targetFile, chatMeta, existing, newMessages)
+	default:
+		return e.updateExistingJSONL(targetFile, chatMeta, existing, newMessages)
+	}
+}
+
+func (e *Exporter) updateExistingJSONL(targetFile string, chatMeta ChatMetadata, existing *ExistingExportInfo, newMessages []*ExportMessage) error {
+	src, err := os.Open(targetFile)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	tmpPath := targetFile + ".tmp"
+	tmp, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+
+	writeFailed := true
+	defer func() {
+		_ = tmp.Close()
+		if writeFailed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	chatMeta.TotalExport = existing.TotalMsgs + len(newMessages)
+	chatMeta.ExportTime = time.Now().UTC()
+	metaLine, err := json.Marshal(map[string]interface{}{
+		"_type": "chat_metadata",
+		"chat":  chatMeta,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(tmp, string(metaLine)); err != nil {
+		return err
+	}
+
+	reader := bufio.NewReaderSize(src, 64*1024)
+	isFirstLine := true
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			if isFirstLine {
+				isFirstLine = false
+				if strings.Contains(trimmed, `"_type"`) && strings.Contains(trimmed, `"chat_metadata"`) {
+					continue
+				}
+			}
+			if _, werr := fmt.Fprintln(tmp, trimmed); werr != nil {
+				return werr
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+	}
+
+	enc := json.NewEncoder(tmp)
+	enc.SetEscapeHTML(false)
+	for _, m := range newMessages {
+		if err := enc.Encode(m); err != nil {
+			return err
+		}
+	}
+
+	writeFailed = false
+	_ = tmp.Close()
+	_ = src.Close()
+
+	return replaceFile(tmpPath, targetFile)
+}
+
+func (e *Exporter) updateExistingJSON(targetFile string, chatMeta ChatMetadata, existing *ExistingExportInfo, newMessages []*ExportMessage) error {
+	data, err := os.ReadFile(targetFile)
+	if err != nil {
+		return err
+	}
+
+	var payload FullJSONPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	seen := make(map[int]bool)
+	for _, m := range payload.Messages {
+		seen[m.ID] = true
+	}
+
+	for _, m := range newMessages {
+		if !seen[m.ID] {
+			payload.Messages = append(payload.Messages, *m)
+			seen[m.ID] = true
+		}
+	}
+
+	if !e.opts.Reverse {
+		sort.Slice(payload.Messages, func(i, j int) bool {
+			return payload.Messages[i].ID < payload.Messages[j].ID
+		})
+	}
+
+	chatMeta.TotalExport = len(payload.Messages)
+	chatMeta.ExportTime = time.Now().UTC()
+	payload.Chat = chatMeta
+
+	tmpPath := targetFile + ".tmp"
+	tmp, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	_ = tmp.Close()
+
+	return replaceFile(tmpPath, targetFile)
+}
+
+func (e *Exporter) updateExistingMarkdown(targetFile string, chatMeta ChatMetadata, existing *ExistingExportInfo, newMessages []*ExportMessage) error {
+	data, err := os.ReadFile(targetFile)
+	if err != nil {
+		return err
+	}
+
+	content := string(data)
+	body := content
+	if sepIdx := strings.Index(content, "---\n\n"); sepIdx != -1 {
+		body = content[sepIdx+len("---\n\n"):]
+	}
+
+	chatMeta.TotalExport = existing.TotalMsgs + len(newMessages)
+	chatMeta.ExportTime = time.Now().UTC()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# Chat Export: %s\n\n", chatMeta.Title))
+	sb.WriteString(fmt.Sprintf("- **Chat ID:** `%d` | **Type:** `%s`\n", chatMeta.ID, chatMeta.Type))
+	if chatMeta.Username != "" {
+		sb.WriteString(fmt.Sprintf("- **Username:** @%s\n", chatMeta.Username))
+	}
+	sb.WriteString(fmt.Sprintf("- **Exported At:** %s | **Messages:** %d\n\n", chatMeta.ExportTime.Format("2006-01-02 15:04:05 UTC"), chatMeta.TotalExport))
+	sb.WriteString("---\n\n")
+
+	sb.WriteString(body)
+	if !strings.HasSuffix(body, "\n\n") && !strings.HasSuffix(body, "---\n\n") {
+		sb.WriteString("\n\n")
+	}
+
+	var newMsgsBuf strings.Builder
+	formatter := NewFormatter(e.opts)
+	for _, m := range newMessages {
+		formatter.renderMarkdownMessage(&newMsgsBuf, m)
+	}
+	sb.WriteString(newMsgsBuf.String())
+
+	tmpPath := targetFile + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(sb.String()), 0o644); err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+
+	return replaceFile(tmpPath, targetFile)
 }
 
 func normalizeChatTarget(target string) (numericID int64, isNumeric bool, normalized string) {
@@ -836,17 +1242,15 @@ func extractCompactReactions(reactions tg.MessageReactions) map[string]int {
 }
 
 func (e *Exporter) prepareOutputWriter(chat ChatMetadata) (io.Writer, func(), error) {
-	if e.opts.OutputFile == "" || e.opts.OutputFile == "-" {
+	filename := e.resolveOutputFileName(chat)
+	if filename == "" {
 		return os.Stdout, func() {}, nil
 	}
 
-	filename := e.opts.OutputFile
-	if !strings.Contains(filename, ".") {
-		ext := e.opts.Format
-		if ext == "markdown" || ext == "transcript" {
-			ext = "md"
+	if dir := filepath.Dir(filename); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, nil, errors.Wrap(err, "create output directory")
 		}
-		filename = fmt.Sprintf("%s.%s", filename, ext)
 	}
 
 	f, err := os.Create(filename)

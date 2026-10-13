@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -48,11 +51,11 @@ func TestNormalizeChatTarget(t *testing.T) {
 		{"", 0, false, ""},
 		{"me", 0, false, ""},
 		{"self", 0, false, ""},
-		{"8085664706", 8085664706, true, "8085664706"},
-		{"-1001697797156", 1697797156, true, "1697797156"},
+		{"1234567890", 1234567890, true, "1234567890"},
+		{"-1001234567890", 1234567890, true, "1234567890"},
 		{"-123456789", 123456789, true, "123456789"},
-		{"https://t.me/c/1697797156/151", 1697797156, true, "1697797156"},
-		{"t.me/c/1697797156", 1697797156, true, "1697797156"},
+		{"https://t.me/c/1234567890/151", 1234567890, true, "1234567890"},
+		{"t.me/c/1234567890", 1234567890, true, "1234567890"},
 		{"@Telegram", 0, false, "Telegram"},
 		{"https://t.me/Telegram/193", 0, false, "Telegram"},
 		{"https://t.me/s/Telegram", 0, false, "Telegram"},
@@ -179,5 +182,216 @@ func TestFormatters(t *testing.T) {
 	}
 	if !strings.Contains(mdStr, "Reactions: 👍 1") {
 		t.Errorf("markdown missing reactions")
+	}
+}
+
+func TestResolveOutputFileName(t *testing.T) {
+	chat := ChatMetadata{Title: "MyChat", ID: 123}
+
+	tests := []struct {
+		outputFile string
+		format     string
+		want       string
+	}{
+		{"", "jsonl", ""},
+		{"-", "jsonl", ""},
+		{"./export/chat.jsonl", "jsonl", "./export/chat.jsonl"},
+		{"./export/chat", "jsonl", "./export/chat.jsonl"},
+		{"export/chat", "markdown", "export/chat.md"},
+		{"chat", "json", "chat.json"},
+		{"chat.txt", "json", "chat.txt"},
+	}
+
+	for _, tt := range tests {
+		exp := &Exporter{opts: ExporterOptions{OutputFile: tt.outputFile, Format: tt.format}}
+		got := exp.resolveOutputFileName(chat)
+		if got != tt.want {
+			t.Errorf("resolveOutputFileName(%q, %q) = %q, want %q", tt.outputFile, tt.format, got, tt.want)
+		}
+	}
+}
+
+func TestInspectAndUpdateExistingExport_JSONL(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "chat.jsonl")
+
+	exp := &Exporter{
+		opts:     ExporterOptions{Format: "jsonl"},
+		msgCache: make(map[int]*ExportMessage),
+	}
+
+	// 1. Inspect empty/non-existent returns error
+	_, err := exp.inspectExistingExport(filePath, "jsonl")
+	if err == nil {
+		t.Fatal("expected error on non-existent file")
+	}
+
+	// 2. Create initial JSONL export with 2 messages
+	meta := ChatMetadata{
+		ID:          123456789,
+		Title:       "Alice",
+		Username:    "alice_user",
+		TotalExport: 2,
+	}
+	initialMsgs := []*ExportMessage{
+		{ID: 100, Time: "2026-10-01 10:00:00", From: "Alice", Text: "Hello"},
+		{ID: 105, Time: "2026-10-01 10:05:00", From: "Bob", Text: "Hey there"},
+	}
+	f, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("create test file: %v", err)
+	}
+	formatter := NewFormatter(exp.opts)
+	if err := formatter.formatJSONL(f, meta, initialMsgs); err != nil {
+		t.Fatalf("format initial jsonl: %v", err)
+	}
+	f.Close()
+
+	// 3. Inspect existing export
+	info, err := exp.inspectExistingExport(filePath, "jsonl")
+	if err != nil {
+		t.Fatalf("inspect existing jsonl: %v", err)
+	}
+	if info.TotalMsgs != 2 {
+		t.Errorf("expected TotalMsgs=2, got %d", info.TotalMsgs)
+	}
+	if info.LastMsgID != 105 {
+		t.Errorf("expected LastMsgID=105, got %d", info.LastMsgID)
+	}
+	if _, ok := info.ExistingIDs[100]; !ok {
+		t.Errorf("expected ExistingIDs to contain 100")
+	}
+	if _, ok := info.ExistingIDs[105]; !ok {
+		t.Errorf("expected ExistingIDs to contain 105")
+	}
+	if exp.msgCache[105] == nil || exp.msgCache[105].Text != "Hey there" {
+		t.Errorf("expected msgCache[105] to be cached for reply enrichment")
+	}
+
+	// 4. Update with new messages (IDs 106 and 110)
+	newMsgs := []*ExportMessage{
+		{ID: 106, Time: "2026-10-02 11:00:00", From: "Alice", Text: "New message"},
+		{ID: 110, Time: "2026-10-02 11:30:00", From: "Bob", Text: "Another one"},
+	}
+	if err := exp.updateExistingExport(filePath, meta, info, newMsgs); err != nil {
+		t.Fatalf("update existing export: %v", err)
+	}
+
+	// 5. Re-inspect to confirm merged count and last ID
+	exp2 := &Exporter{opts: ExporterOptions{Format: "jsonl"}, msgCache: make(map[int]*ExportMessage)}
+	info2, err := exp2.inspectExistingExport(filePath, "jsonl")
+	if err != nil {
+		t.Fatalf("re-inspect jsonl: %v", err)
+	}
+	if info2.TotalMsgs != 4 {
+		t.Errorf("expected TotalMsgs=4 after update, got %d", info2.TotalMsgs)
+	}
+	if info2.LastMsgID != 110 {
+		t.Errorf("expected LastMsgID=110, got %d", info2.LastMsgID)
+	}
+	if info2.Metadata == nil || info2.Metadata.TotalExport != 4 {
+		t.Errorf("expected metadata TotalExport=4, got %+v", info2.Metadata)
+	}
+}
+
+func TestInspectAndUpdateExistingExport_JSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "chat.json")
+
+	exp := &Exporter{
+		opts:     ExporterOptions{Format: "json"},
+		msgCache: make(map[int]*ExportMessage),
+	}
+
+	meta := ChatMetadata{ID: 123, Title: "Test Chat", Type: "channel"}
+	initialMsgs := []*ExportMessage{
+		{ID: 50, Time: "2026-09-01 10:00:00", From: "Admin", Text: "Welcome"},
+	}
+	f, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("create test file: %v", err)
+	}
+	formatter := NewFormatter(exp.opts)
+	if err := formatter.formatFullJSON(f, meta, initialMsgs); err != nil {
+		t.Fatalf("format initial json: %v", err)
+	}
+	f.Close()
+
+	info, err := exp.inspectExistingExport(filePath, "json")
+	if err != nil {
+		t.Fatalf("inspect json: %v", err)
+	}
+	if info.TotalMsgs != 1 || info.LastMsgID != 50 {
+		t.Errorf("unexpected inspect info: %+v", info)
+	}
+
+	newMsgs := []*ExportMessage{
+		{ID: 55, Time: "2026-09-02 10:00:00", From: "Admin", Text: "Update 1"},
+	}
+	if err := exp.updateExistingExport(filePath, meta, info, newMsgs); err != nil {
+		t.Fatalf("update json: %v", err)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read updated json: %v", err)
+	}
+	var payload FullJSONPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal updated json: %v", err)
+	}
+	if payload.Chat.TotalExport != 2 || len(payload.Messages) != 2 {
+		t.Errorf("expected 2 messages in payload, got %d (%d)", payload.Chat.TotalExport, len(payload.Messages))
+	}
+}
+
+func TestInspectAndUpdateExistingExport_Markdown(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "chat.md")
+
+	exp := &Exporter{
+		opts:     ExporterOptions{Format: "markdown"},
+		msgCache: make(map[int]*ExportMessage),
+	}
+
+	meta := ChatMetadata{ID: 789, Title: "MD Chat", Type: "group"}
+	initialMsgs := []*ExportMessage{
+		{ID: 1, Time: "2026-01-01 00:00:00", From: "User1", Text: "First"},
+	}
+	f, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("create test file: %v", err)
+	}
+	formatter := NewFormatter(exp.opts)
+	if err := formatter.formatMarkdown(f, meta, initialMsgs); err != nil {
+		t.Fatalf("format initial md: %v", err)
+	}
+	f.Close()
+
+	info, err := exp.inspectExistingExport(filePath, "markdown")
+	if err != nil {
+		t.Fatalf("inspect md: %v", err)
+	}
+	if info.TotalMsgs != 1 || info.LastMsgID != 1 {
+		t.Errorf("unexpected md info: %+v", info)
+	}
+
+	newMsgs := []*ExportMessage{
+		{ID: 2, Time: "2026-01-01 00:01:00", From: "User2", Text: "Second"},
+	}
+	if err := exp.updateExistingExport(filePath, meta, info, newMsgs); err != nil {
+		t.Fatalf("update md: %v", err)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read updated md: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "**Messages:** 2") {
+		t.Errorf("expected header to contain '- **Messages:** 2', got:\n%s", content)
+	}
+	if !strings.Contains(content, "### [1] User1") || !strings.Contains(content, "### [2] User2") {
+		t.Errorf("expected both messages in markdown, got:\n%s", content)
 	}
 }

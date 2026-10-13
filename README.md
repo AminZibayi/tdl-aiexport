@@ -16,14 +16,15 @@ Transforms Telegram conversations into token-dense, context-aware datasets ready
 
 ## Highlights
 
+- **Automatic incremental sync & resume:** When exporting to an existing file (`jsonl`, `json`, `markdown`), automatically detects the last exported message ID and fetches only new messages since the last export—updating the dataset atomically in seconds without re-downloading old history.
 - **Token-dense for LLM context:** Drops redundant Unix epoch integers, serializes compact key-value reactions (`{"❤": 1}`), flattens sender identity, and strips empty fields to maximize context window efficiency.
+- **Universal chat resolution:** Seamlessly resolves plain numeric user/chat IDs (`1234567890`), negative Bot API / TDLib IDs (`-100...`, `-...`), usernames (`@username`), public links (`t.me/...`), and private channel links (`t.me/c/...`).
 - **Unified media pipeline:** When `--download-media` is enabled, media assets (photos, stickers, voice notes, audio, video) are downloaded locally, and relative paths are embedded directly into your chosen format (`jsonl`, `json`, or `markdown`).
 - **Selective filtering & size caps:** Granularly include or exclude media types (`--media-types photo,sticker,voice`, `--exclude-media video`) and guard bandwidth with per-asset download thresholds (`--max-media-size 10MB`).
 - **Full multimodal & sticker support:** Embeds semantic sticker emojis (`[Sticker: 👍]`) for text LLMs, downloads WebP/JPEG for vision models (VLMs), and downloads OGG audio for speech-to-text models.
 - **Chronological conversation flow:** Automatically sorts messages oldest-to-newest so AI models process conversations naturally from beginning to end.
 - **Rich context preservation:** Inlines parent message IDs, author names, and quote snippets into replies, and preserves forwarded origins.
 - **Native `tdl` integration:** Hooks seamlessly into `tdl`'s official extension ecosystem and authenticated MTProto session.
-
 ---
 
 ## Quick Start
@@ -124,8 +125,9 @@ Reactions: ❤ 2
 | `--skip-service` | | `true` | Skip service/system events (joins, pins, title changes) |
 | `--text-only` | | `false` | Export only messages containing text |
 | `--with-media` | | `true` | Include media metadata and paths |
+| `--update` | `-u` | `true` | Automatically detect last exported message in existing output file and update with new messages |
+| `--overwrite` | | `false` | Overwrite existing export file completely instead of updating incrementally |
 | `--verbose` | `-v` | `false` | Enable verbose debug logging |
-
 ---
 
 ## Examples
@@ -135,28 +137,47 @@ Reactions: ❤ 2
 tdl aiexport -c golang_chat -n 1000 -f jsonl -o golang_chat.jsonl
 ```
 
-### 2. Export with Selective Media & Download Threshold (VLMs)
+### 2. Automatic Incremental Sync (Continuous Updating)
+Run the export command periodically. It automatically detects the last exported message and appends only newly arrived messages:
+```bash
+# First run: exports full chat history
+tdl aiexport -c mychat -f jsonl -o ./export/chat.jsonl
+
+# Subsequent runs: detects last message ID and only fetches new messages
+tdl aiexport -c mychat -f jsonl -o ./export/chat.jsonl
+```
+
+### 3. Export via Numeric Chat ID or Bot API / TDLib ID
+Works with user IDs, group IDs, and channels using numeric IDs or negative TDLib format:
+```bash
+# Plain numeric User ID or Chat ID:
+tdl aiexport -c 1234567890 -f jsonl -o user.jsonl
+
+# Negative Bot API / TDLib Channel ID:
+tdl aiexport -c -1001234567890 -f jsonl -o channel.jsonl
+```
+### 4. Export with Selective Media & Download Threshold (VLMs)
 Downloads photos, stickers, and voice notes capped at 10MB each:
 ```bash
 tdl aiexport -c mygroup -n 100 -f jsonl -d --media-types photo,sticker,voice --max-media-size 10MB -o export.jsonl
 ```
 
-### 3. Markdown Transcript for Prompt Context
+### 5. Markdown Transcript for Prompt Context
 ```bash
 tdl aiexport -c mychannel -n 50 -f markdown -d --media-types photo,sticker -o transcript.md
 ```
 
-### 4. Forum Topic / Group Thread Export
+### 6. Forum Topic / Group Thread Export
 ```bash
 tdl aiexport -c -100123456789 --topic 251011 -f jsonl -o topic.jsonl
 ```
 
-### 5. Date Range Filtering
+### 7. Date Range Filtering
 ```bash
 tdl aiexport -c mygroup --since 2026-01-01 --until 2026-03-01 -f jsonl -o q1_archive.jsonl
 ```
 
-### 6. Exclude Heavy Media Types
+### 8. Exclude Heavy Media Types
 ```bash
 tdl aiexport -c mygroup -n 200 -d --exclude-media video,document -o chat.jsonl
 ```

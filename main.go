@@ -32,6 +32,8 @@ var (
 	excludeMedia  string
 	maxMediaSize  string
 	verbose       bool
+	updateMode    bool
+	overwriteMode bool
 )
 
 func init() {
@@ -54,6 +56,8 @@ func init() {
 	pflag.StringVar(&excludeMedia, "exclude-media", "", "Comma-separated media types to exclude from download (e.g. video,document)")
 	pflag.StringVar(&maxMediaSize, "max-media-size", "20MB", "Max download size threshold per asset (e.g. 10MB, 500KB, 0 for unlimited)")
 	pflag.BoolVarP(&verbose, "verbose", "v", false, "Enable verbose logging")
+	pflag.BoolVarP(&updateMode, "update", "u", true, "Automatically detect last exported message in existing output file and update with new messages (default: true)")
+	pflag.BoolVar(&overwriteMode, "overwrite", false, "Overwrite existing export file completely instead of updating incrementally")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "tdl-aiexport - Machine-readable & AI-friendly Telegram chat exporter\n\n")
@@ -101,6 +105,8 @@ func main() {
 			MediaTypes:    mediaTypes,
 			ExcludeMedia:  excludeMedia,
 			MaxMediaSize:  maxMediaSize,
+			UpdateMode:    updateMode,
+			Overwrite:     overwriteMode,
 		}
 
 		exporter := NewExporter(ext, opts)
